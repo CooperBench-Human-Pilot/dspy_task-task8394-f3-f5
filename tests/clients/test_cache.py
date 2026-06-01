@@ -6,7 +6,7 @@ import pytest
 from cachetools import LRUCache
 from diskcache import FanoutCache
 
-from dspy.clients.cache import Cache
+from dspy.clients.cache import Cache, _MAGIC_HEADER
 
 
 @dataclass
@@ -280,3 +280,193 @@ async def test_request_cache_decorator_async(cache):
         # Call with different arguments should compute again
         result3 = await test_function(prompt="Different", model="openai/gpt-4o-mini")
         assert result3 == "Response for Different with openai/gpt-4o-mini"
+
+
+# ---------------------------------------------------------------------------
+# Compression tests
+# ---------------------------------------------------------------------------
+
+
+def test_initialization_with_compression(tmp_path):
+    """Test cache initialization with compression enabled."""
+    cache = Cache(
+        enable_disk_cache=True,
+        enable_memory_cache=True,
+        disk_cache_dir=str(tmp_path),
+        disk_size_limit_bytes=1024 * 1024,
+        memory_max_entries=100,
+        compress="gzip",
+    )
+    assert cache.compress == "gzip"
+    assert isinstance(cache.disk_cache, FanoutCache)
+
+
+def test_initialization_with_eviction_params(tmp_path):
+    """Test cache initialization with eviction knobs."""
+    cache = Cache(
+        enable_disk_cache=True,
+        enable_memory_cache=True,
+        disk_cache_dir=str(tmp_path),
+        disk_size_limit_bytes=1024 * 1024,
+        memory_max_entries=100,
+        cull_limit=5,
+        eviction_policy="least-recently-used",
+    )
+    assert isinstance(cache.disk_cache, FanoutCache)
+
+
+def test_initialization_invalid_compression(tmp_path):
+    """Test that invalid compression codec raises ValueError."""
+    with pytest.raises(ValueError, match="Unsupported compression codec"):
+        Cache(
+            enable_disk_cache=True,
+            enable_memory_cache=True,
+            disk_cache_dir=str(tmp_path),
+            disk_size_limit_bytes=1024 * 1024,
+            memory_max_entries=100,
+            compress="lz4",
+        )
+
+
+def test_serialize_deserialize_gzip(tmp_path):
+    """Test gzip compression round-trip via _serialize/_deserialize."""
+    cache = Cache(
+        enable_disk_cache=True,
+        enable_memory_cache=False,
+        disk_cache_dir=str(tmp_path),
+        compress="gzip",
+    )
+    original = {"key": "value", "nested": [1, 2, 3]}
+    blob = cache._serialize(original)
+    assert isinstance(blob, bytes)
+    assert blob[:4] == _MAGIC_HEADER
+    assert blob[4] == 0x01
+    result = cache._deserialize(blob)
+    assert result == original
+
+
+def test_serialize_deserialize_zlib(tmp_path):
+    """Test zlib compression round-trip via _serialize/_deserialize."""
+    cache = Cache(
+        enable_disk_cache=True,
+        enable_memory_cache=False,
+        disk_cache_dir=str(tmp_path),
+        compress="zlib",
+    )
+    original = {"key": "value", "nested": [1, 2, 3]}
+    blob = cache._serialize(original)
+    assert isinstance(blob, bytes)
+    assert blob[:4] == _MAGIC_HEADER
+    assert blob[4] == 0x02
+    result = cache._deserialize(blob)
+    assert result == original
+
+
+def test_serialize_no_compression(tmp_path):
+    """Test that no compression returns value unchanged."""
+    cache = Cache(
+        enable_disk_cache=True,
+        enable_memory_cache=False,
+        disk_cache_dir=str(tmp_path),
+        compress=None,
+    )
+    original = {"key": "value"}
+    assert cache._serialize(original) is original
+
+
+def test_put_and_get_with_gzip_compression(tmp_path):
+    """Test full put/get cycle through disk with gzip compression."""
+    cache = Cache(
+        enable_disk_cache=True,
+        enable_memory_cache=True,
+        disk_cache_dir=str(tmp_path),
+        disk_size_limit_bytes=1024 * 1024,
+        memory_max_entries=100,
+        compress="gzip",
+    )
+    request = {"prompt": "Hello", "model": "openai/gpt-4o-mini"}
+    value = DummyResponse(message="Compressed response", usage={"tokens": 10})
+
+    cache.put(request, value)
+    cache.reset_memory_cache()
+
+    result = cache.get(request)
+    assert result is not None
+    assert result.message == "Compressed response"
+    assert result.usage == {}
+
+
+def test_put_and_get_with_zlib_compression(tmp_path):
+    """Test full put/get cycle through disk with zlib compression."""
+    cache = Cache(
+        enable_disk_cache=True,
+        enable_memory_cache=True,
+        disk_cache_dir=str(tmp_path),
+        disk_size_limit_bytes=1024 * 1024,
+        memory_max_entries=100,
+        compress="zlib",
+    )
+    request = {"prompt": "Hello", "model": "openai/gpt-4o-mini"}
+    value = DummyResponse(message="Compressed response", usage={"tokens": 10})
+
+    cache.put(request, value)
+    cache.reset_memory_cache()
+
+    result = cache.get(request)
+    assert result is not None
+    assert result.message == "Compressed response"
+
+
+def test_backward_compatibility_legacy_entries(tmp_path):
+    """Entries written without compression are still readable when compression is enabled."""
+    cache_v1 = Cache(
+        enable_disk_cache=True,
+        enable_memory_cache=False,
+        disk_cache_dir=str(tmp_path),
+        disk_size_limit_bytes=1024 * 1024,
+        memory_max_entries=100,
+        compress=None,
+    )
+    request = {"prompt": "Legacy", "model": "gpt-4"}
+    cache_v1.put(request, "legacy_value")
+
+    cache_v2 = Cache(
+        enable_disk_cache=True,
+        enable_memory_cache=False,
+        disk_cache_dir=str(tmp_path),
+        disk_size_limit_bytes=1024 * 1024,
+        memory_max_entries=100,
+        compress="gzip",
+    )
+    result = cache_v2.get(request)
+    assert result == "legacy_value"
+
+
+def test_compression_reduces_disk_size(tmp_path):
+    """Compressed entries should be smaller on disk than uncompressed ones."""
+    dir_plain = tmp_path / "plain"
+    dir_gzip = tmp_path / "gzip"
+
+    cache_plain = Cache(
+        enable_disk_cache=True,
+        enable_memory_cache=False,
+        disk_cache_dir=str(dir_plain),
+        compress=None,
+    )
+    cache_gzip = Cache(
+        enable_disk_cache=True,
+        enable_memory_cache=False,
+        disk_cache_dir=str(dir_gzip),
+        compress="gzip",
+    )
+
+    large_value = {"text": "a" * 10000, "data": list(range(1000))}
+    request = {"prompt": "size_test"}
+
+    cache_plain.put(request, large_value)
+    cache_gzip.put(request, large_value)
+
+    plain_size = sum(f.stat().st_size for f in dir_plain.rglob("*") if f.is_file())
+    gzip_size = sum(f.stat().st_size for f in dir_gzip.rglob("*") if f.is_file())
+
+    assert gzip_size < plain_size
