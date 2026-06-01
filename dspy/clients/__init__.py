@@ -33,6 +33,10 @@ def configure_cache(
     disk_size_limit_bytes: Optional[int] = DISK_CACHE_LIMIT,
     memory_max_entries: Optional[int] = 1000000,
     enable_litellm_cache: bool = False,
+    compress: Optional[str] = None,
+    cull_limit: Optional[int] = None,
+    eviction_policy: Optional[str] = None,
+    ttl: Optional[int] = None,
 ):
     """Configure the cache for DSPy.
 
@@ -43,6 +47,13 @@ def configure_cache(
         disk_size_limit_bytes: The size limit of the on-disk cache.
         memory_max_entries: The maximum number of entries in the in-memory cache.
         enable_litellm_cache: Whether to enable LiteLLM cache.
+        compress: Optional on-disk compression codec (e.g. "gzip", "zlib"). When None, values are
+            stored uncompressed.
+        cull_limit: Maximum number of entries diskcache culls on each write when over the size
+            limit. When None, diskcache's default is used.
+        eviction_policy: diskcache eviction policy. When None, diskcache's default is used.
+        ttl: Optional time-to-live, in seconds, after which cache entries expire. When None
+            (the default), entries never expire.
     """
     if enable_disk_cache and enable_litellm_cache:
         raise ValueError(
@@ -72,6 +83,35 @@ def configure_cache(
         disk_cache_dir,
         disk_size_limit_bytes,
         memory_max_entries,
+        compress=compress,
+        cull_limit=cull_limit,
+        eviction_policy=eviction_policy,
+        ttl=ttl,
+    )
+
+
+def set_ttl(seconds: Optional[int]) -> None:
+    """Set the time-to-live (in seconds) for cache entries.
+
+    Rebuilds the active DSPy cache with the given TTL while preserving all other settings. Pass
+    ``None`` to restore the default infinite-life behavior.
+
+    Args:
+        seconds: Number of seconds after which cache entries expire, or None to never expire.
+    """
+    import dspy
+
+    cache = dspy.cache
+    configure_cache(
+        enable_disk_cache=cache.enable_disk_cache,
+        enable_memory_cache=cache.enable_memory_cache,
+        disk_cache_dir=cache.disk_cache_dir,
+        disk_size_limit_bytes=cache.disk_size_limit_bytes,
+        memory_max_entries=cache.memory_max_entries,
+        compress=cache.compress,
+        cull_limit=cache.cull_limit,
+        eviction_policy=cache.eviction_policy,
+        ttl=seconds,
     )
 
 
@@ -84,6 +124,7 @@ DSPY_CACHE = Cache(
     disk_cache_dir=DISK_CACHE_DIR,
     disk_size_limit_bytes=DISK_CACHE_LIMIT,
     memory_max_entries=1000000,
+    ttl=None,
 )
 
 # Turn off by default to avoid LiteLLM logging during every LM call.
@@ -112,4 +153,5 @@ __all__ = [
     "enable_litellm_logging",
     "disable_litellm_logging",
     "configure_cache",
+    "set_ttl",
 ]
