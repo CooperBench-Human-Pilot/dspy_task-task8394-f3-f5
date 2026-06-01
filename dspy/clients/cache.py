@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 import cloudpickle
 import pydantic
 import ujson
-from cachetools import LRUCache
+from cachetools import LRUCache, TTLCache
 from diskcache import FanoutCache
 
 logger = logging.getLogger(__name__)
@@ -30,7 +30,10 @@ class Cache:
         disk_cache_dir: str,
         disk_size_limit_bytes: Optional[int] = 1024 * 1024 * 10,
         memory_max_entries: Optional[int] = 1000000,
-
+        compress: Optional[str] = None,
+        cull_limit: Optional[int] = None,
+        eviction_policy: Optional[str] = None,
+        ttl: Optional[int] = None,
     ):
         """
         Args:
@@ -39,20 +42,45 @@ class Cache:
             disk_cache_dir: The directory where the disk cache is stored.
             disk_size_limit_bytes: The maximum size of the disk cache (in bytes).
             memory_max_entries: The maximum size of the in-memory cache (in number of items).
+            compress: Optional on-disk compression codec (e.g. "gzip", "zlib"). When None, values
+                are stored uncompressed. The compression codec is applied by the disk layer.
+            cull_limit: Maximum number of entries diskcache culls on each write when over the size
+                limit. When None, diskcache's default is used.
+            eviction_policy: diskcache eviction policy (e.g. "least-recently-used",
+                "least-frequently-used"). When None, diskcache's default is used.
+            ttl: Optional time-to-live, in seconds, after which cache entries expire. When None
+                (the default), entries never expire, preserving the original cache behavior.
         """
 
         self.enable_disk_cache = enable_disk_cache
         self.enable_memory_cache = enable_memory_cache
+        self.disk_cache_dir = disk_cache_dir
+        self.disk_size_limit_bytes = disk_size_limit_bytes
+        self.memory_max_entries = memory_max_entries
+        self.compress = compress
+        self.cull_limit = cull_limit
+        self.eviction_policy = eviction_policy
+        self.ttl = ttl
         if self.enable_memory_cache:
-            self.memory_cache = LRUCache(maxsize=memory_max_entries)
+            if ttl is not None:
+                self.memory_cache = TTLCache(maxsize=memory_max_entries, ttl=ttl)
+            else:
+                self.memory_cache = LRUCache(maxsize=memory_max_entries)
         else:
             self.memory_cache = {}
         if self.enable_disk_cache:
+            # Only forward eviction knobs when set so diskcache's own defaults are preserved.
+            disk_cache_kwargs = {}
+            if cull_limit is not None:
+                disk_cache_kwargs["cull_limit"] = cull_limit
+            if eviction_policy is not None:
+                disk_cache_kwargs["eviction_policy"] = eviction_policy
             self.disk_cache = FanoutCache(
                 shards=16,
                 timeout=10,
                 directory=disk_cache_dir,
                 size_limit=disk_size_limit_bytes,
+                **disk_cache_kwargs,
             )
         else:
             self.disk_cache = {}
@@ -113,6 +141,13 @@ class Cache:
                 with self._lock:
                     self.memory_cache[key] = response
         else:
+            # Miss on both layers. When TTL is enabled, lazily purge expired entries from the
+            # on-disk store so it does not accumulate stale keys.
+            if self.ttl is not None and self.enable_disk_cache:
+                try:
+                    self.disk_cache.expire()
+                except Exception as e:
+                    logger.debug(f"Failed to expire disk cache entries: {e}")
             return None
 
         response = copy.deepcopy(response)
@@ -140,7 +175,9 @@ class Cache:
 
         if self.enable_disk_cache:
             try:
-                self.disk_cache[key] = value
+                # Always go through .set() so compression (friend's _serialize) and TTL (expire)
+                # compose. expire=None means no expiry, matching the original behavior.
+                self.disk_cache.set(key, value, expire=self.ttl)
             except Exception as e:
                 # Disk cache writing can fail for different reasons, e.g. disk full or the `value` is not picklable.
                 logger.debug(f"Failed to put value in disk cache: {value}, {e}")
