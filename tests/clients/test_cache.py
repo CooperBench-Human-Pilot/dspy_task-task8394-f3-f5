@@ -6,7 +6,7 @@ import pytest
 from cachetools import LRUCache
 from diskcache import FanoutCache
 
-from dspy.clients.cache import Cache, _MAGIC_HEADER
+from dspy.clients.cache import _MAGIC_HEADER, Cache
 
 
 @dataclass
