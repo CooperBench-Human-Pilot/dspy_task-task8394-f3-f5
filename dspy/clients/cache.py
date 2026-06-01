@@ -1,7 +1,10 @@
 import copy
+import gzip
 import inspect
 import logging
+import pickle
 import threading
+import zlib
 from functools import wraps
 from hashlib import sha256
 from typing import Any, Dict, Optional
@@ -9,10 +12,12 @@ from typing import Any, Dict, Optional
 import cloudpickle
 import pydantic
 import ujson
-from cachetools import LRUCache
+from cachetools import LRUCache, TTLCache
 from diskcache import FanoutCache
 
 logger = logging.getLogger(__name__)
+
+_MAGIC_HEADER = b"DSPC"
 
 
 class Cache:
@@ -30,7 +35,10 @@ class Cache:
         disk_cache_dir: str,
         disk_size_limit_bytes: Optional[int] = 1024 * 1024 * 10,
         memory_max_entries: Optional[int] = 1000000,
-
+        compress: Optional[str] = None,
+        cull_limit: Optional[int] = None,
+        eviction_policy: Optional[str] = None,
+        ttl: Optional[int] = None,
     ):
         """
         Args:
@@ -39,25 +47,94 @@ class Cache:
             disk_cache_dir: The directory where the disk cache is stored.
             disk_size_limit_bytes: The maximum size of the disk cache (in bytes).
             memory_max_entries: The maximum size of the in-memory cache (in number of items).
+            compress: Optional on-disk compression codec (e.g. "gzip", "zlib"). When None, values
+                are stored uncompressed. The compression codec is applied by the disk layer.
+            cull_limit: Maximum number of entries diskcache culls on each write when over the size
+                limit. When None, diskcache's default is used.
+            eviction_policy: diskcache eviction policy (e.g. "least-recently-used",
+                "least-frequently-used"). When None, diskcache's default is used.
+            ttl: Optional time-to-live, in seconds, after which cache entries expire. When None
+                (the default), entries never expire, preserving the original cache behavior.
         """
+
+        if compress is not None and compress not in ("gzip", "zlib"):
+            raise ValueError(
+                f"Unsupported compression codec: {compress!r}. "
+                "Supported values are 'gzip', 'zlib', or None."
+            )
 
         self.enable_disk_cache = enable_disk_cache
         self.enable_memory_cache = enable_memory_cache
+        self.disk_cache_dir = disk_cache_dir
+        self.disk_size_limit_bytes = disk_size_limit_bytes
+        self.memory_max_entries = memory_max_entries
+        self.compress = compress
+        self.cull_limit = cull_limit
+        self.eviction_policy = eviction_policy
+        self.ttl = ttl
         if self.enable_memory_cache:
-            self.memory_cache = LRUCache(maxsize=memory_max_entries)
+            if ttl is not None:
+                self.memory_cache = TTLCache(maxsize=memory_max_entries, ttl=ttl)
+            else:
+                self.memory_cache = LRUCache(maxsize=memory_max_entries)
         else:
             self.memory_cache = {}
         if self.enable_disk_cache:
+            # Only forward eviction knobs when set so diskcache's own defaults are preserved.
+            disk_cache_kwargs = {}
+            if cull_limit is not None:
+                disk_cache_kwargs["cull_limit"] = cull_limit
+            if eviction_policy is not None:
+                disk_cache_kwargs["eviction_policy"] = eviction_policy
             self.disk_cache = FanoutCache(
                 shards=16,
                 timeout=10,
                 directory=disk_cache_dir,
                 size_limit=disk_size_limit_bytes,
+                **disk_cache_kwargs,
             )
         else:
             self.disk_cache = {}
 
         self._lock = threading.RLock()
+
+    def _serialize(self, value):
+        """Serialize a value for disk storage, optionally compressing it.
+
+        When compression is enabled, pickles the value, compresses it, and
+        prepends a 5-byte magic header. When compression is None, returns the
+        value unchanged so FanoutCache handles serialization natively.
+        """
+        if self.compress is None:
+            return value
+
+        data = pickle.dumps(value)
+        if self.compress == "gzip":
+            data = gzip.compress(data)
+            codec = 0x01
+        elif self.compress == "zlib":
+            data = zlib.compress(data)
+            codec = 0x02
+        else:
+            codec = 0x00
+        return _MAGIC_HEADER + bytes([codec]) + data
+
+    def _deserialize(self, value):
+        """Deserialize a value read from disk, handling both new and legacy formats.
+
+        If the value is bytes starting with the magic header, reads the codec
+        byte, decompresses if needed, and unpickles. Otherwise returns the value
+        as-is (legacy format already unpickled by FanoutCache).
+        """
+        if isinstance(value, bytes) and len(value) > 4 and value[:4] == _MAGIC_HEADER:
+            codec = value[4]
+            payload = value[5:]
+            if codec == 0x01:
+                payload = gzip.decompress(payload)
+            elif codec == 0x02:
+                payload = zlib.decompress(payload)
+            return pickle.loads(payload)
+        return value
 
     def __contains__(self, key: str) -> bool:
         """Check if a key is in the cache."""
@@ -108,11 +185,18 @@ class Cache:
                 response = self.memory_cache[key]
         elif self.enable_disk_cache and key in self.disk_cache:
             # Found on disk but not in memory cache, add to memory cache
-            response = self.disk_cache[key]
+            response = self._deserialize(self.disk_cache[key])
             if self.enable_memory_cache:
                 with self._lock:
                     self.memory_cache[key] = response
         else:
+            # Miss on both layers. When TTL is enabled, lazily purge expired entries from the
+            # on-disk store so it does not accumulate stale keys.
+            if self.ttl is not None and self.enable_disk_cache:
+                try:
+                    self.disk_cache.expire()
+                except Exception as e:
+                    logger.debug(f"Failed to expire disk cache entries: {e}")
             return None
 
         response = copy.deepcopy(response)
@@ -140,7 +224,7 @@ class Cache:
 
         if self.enable_disk_cache:
             try:
-                self.disk_cache[key] = value
+                self.disk_cache.set(key, self._serialize(value), expire=self.ttl)
             except Exception as e:
                 # Disk cache writing can fail for different reasons, e.g. disk full or the `value` is not picklable.
                 logger.debug(f"Failed to put value in disk cache: {value}, {e}")
